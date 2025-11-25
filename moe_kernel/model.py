@@ -73,7 +73,7 @@ class MoELayer(nn.Module):
                 x_offsets = current_token_idx * stride_x_n + tl.arange(0, D_MODEL) * stride_x_d
                 x_token = tl.load(x_ptr + x_offsets) # Shape: (D_MODEL,)
 
-                output_token_accumulator = tl.zeros((D_MODEL,), dtype=tl.float32)
+                output_token_accumulator = tl.zeros((1, D_MODEL), dtype=tl.float32)
 
                 for k in range(TOP_K):
                     expert_idx = tl.load(expert_indices_ptr + current_token_idx * stride_ei_n + k)
