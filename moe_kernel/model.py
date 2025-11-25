@@ -99,7 +99,7 @@ class MoELayer(nn.Module):
                     fused_result = activated_hidden * gate_val
                     expert_output = tl.dot(fused_result, w2)
 
-                    output_token_accumulator += expert_output[0] * gate_weight
+                    output_token_accumulator += expert_output * gate_weight
 
                 # Store the final result for the token
                 output_offsets = current_token_idx * stride_o_n + tl.arange(0, D_MODEL) * stride_o_d
