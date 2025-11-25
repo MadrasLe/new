@@ -64,10 +64,10 @@ class MoELayer(nn.Module):
         BLOCK_SIZE_N: tl.constexpr
     ):
         pid = tl.program_id(0)
-        token_block_idx = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
         for i in range(BLOCK_SIZE_N):
-            current_token_idx = token_block_idx[i]
+            # Calculate the token index directly, avoiding tensor indexing
+            current_token_idx = pid * BLOCK_SIZE_N + i
             if current_token_idx < n_tokens:
                 # Load data for the current token
                 x_offsets = current_token_idx * stride_x_n + tl.arange(0, D_MODEL) * stride_x_d
