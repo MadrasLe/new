@@ -47,88 +47,85 @@ class MoELayer(nn.Module):
         return output
 
     @staticmethod
-    @triton.autotune(
-        configs=[
-            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_FF': 32}, num_stages=3, num_warps=2),
-            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_K': 32, 'BLOCK_SIZE_FF': 64}, num_stages=3, num_warps=4),
-            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 64, 'BLOCK_SIZE_FF': 32}, num_stages=4, num_warps=2),
-            triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_K': 128, 'BLOCK_SIZE_FF': 32}, num_stages=4, num_warps=4),
-        ],
-        key=['d_model', 'd_ff'],
-    )
     @triton.jit
     def fused_swiglu_kernel(
         x_ptr, expert_indices_ptr, gate_weights_ptr,
         weights1_ptr, weights_gate_ptr, weights2_ptr,
         output_ptr,
         n_tokens,
+        stride_x_n, stride_x_d,
+        stride_ei_n, stride_ei_k,
+        stride_gw_n, stride_gw_k,
+        stride_w1_e, stride_w1_d, stride_w1_f,
+        stride_wg_e, stride_wg_d, stride_wg_f,
+        stride_w2_e, stride_w2_f, stride_w2_d,
+        stride_o_n, stride_o_d,
         D_MODEL: tl.constexpr, D_FF: tl.constexpr, TOP_K: tl.constexpr,
-        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, BLOCK_SIZE_FF: tl.constexpr
+        BLOCK_SIZE_N: tl.constexpr
     ):
         pid = tl.program_id(0)
-        # Each program computes a BLOCK_SIZE_M block of tokens
-        token_offsets = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        token_mask = token_offsets < n_tokens
+        token_block_idx = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-        final_output = tl.zeros((BLOCK_SIZE_M, D_MODEL), dtype=tl.float32)
+        for i in range(BLOCK_SIZE_N):
+            current_token_idx = token_block_idx[i]
+            if current_token_idx < n_tokens:
+                # Load data for the current token
+                x_offsets = current_token_idx * stride_x_n + tl.arange(0, D_MODEL) * stride_x_d
+                x_token = tl.load(x_ptr + x_offsets) # Shape: (D_MODEL,)
 
-        for k in range(TOP_K):
-            # Load expert indices and gate weights for the block
-            expert_indices = tl.load(expert_indices_ptr + token_offsets * TOP_K + k, mask=token_mask)
-            gate_weights = tl.load(gate_weights_ptr + token_offsets * TOP_K + k, mask=token_mask)
+                output_token_accumulator = tl.zeros((D_MODEL,), dtype=tl.float32)
 
-            # --- Tiled GEMM for W1 and W_gate ---
-            acc1 = tl.zeros((BLOCK_SIZE_M, D_FF), dtype=tl.float32)
-            acc_gate = tl.zeros((BLOCK_SIZE_M, D_FF), dtype=tl.float32)
+                for k in range(TOP_K):
+                    expert_idx = tl.load(expert_indices_ptr + current_token_idx * stride_ei_n + k)
+                    gate_weight = tl.load(gate_weights_ptr + current_token_idx * stride_gw_n + k)
 
-            for i in range(0, D_MODEL, BLOCK_SIZE_K):
-                x_offsets = token_offsets[:, None] * D_MODEL + (i + tl.arange(0, BLOCK_SIZE_K))[None, :]
-                x_chunk = tl.load(x_ptr + x_offsets, mask=token_mask[:, None])
+                    # Load expert weights (2D matrices)
+                    w1_offsets = expert_idx * stride_w1_e + tl.arange(0, D_MODEL)[:, None] * stride_w1_d + tl.arange(0, D_FF)[None, :] * stride_w1_f
+                    w1 = tl.load(weights1_ptr + w1_offsets)
 
-                # Gather weights for the block of tokens
-                w1_offsets = expert_indices[:, None, None] * D_MODEL * D_FF + (i + tl.arange(0, BLOCK_SIZE_K))[None, :, None] * D_FF + tl.arange(0, D_FF)[None, None, :]
-                w1_chunk = tl.load(weights1_ptr + w1_offsets, mask=token_mask[:, None, None])
+                    wg_offsets = expert_idx * stride_wg_e + tl.arange(0, D_MODEL)[:, None] * stride_wg_d + tl.arange(0, D_FF)[None, :] * stride_wg_f
+                    w_gate = tl.load(weights_gate_ptr + wg_offsets)
 
-                wg_offsets = expert_indices[:, None, None] * D_MODEL * D_FF + (i + tl.arange(0, BLOCK_SIZE_K))[None, :, None] * D_FF + tl.arange(0, D_FF)[None, None, :]
-                wg_chunk = tl.load(weights_gate_ptr + wg_offsets, mask=token_mask[:, None, None])
+                    w2_offsets = expert_idx * stride_w2_e + tl.arange(0, D_FF)[:, None] * stride_w2_f + tl.arange(0, D_MODEL)[None, :] * stride_w2_d
+                    w2 = tl.load(weights2_ptr + w2_offsets)
 
-                acc1 += tl.dot(x_chunk, w1_chunk)
-                acc_gate += tl.dot(x_chunk, wg_chunk)
+                    # FFN computation using 2D dot products
+                    hidden1 = tl.dot(x_token[None, :], w1)
+                    gate_val = tl.dot(x_token[None, :], w_gate)
 
-            # Apply SwiGLU activation
-            silu_acc1 = acc1 * tl.sigmoid(acc1)
-            fused_hidden = silu_acc1 * acc_gate
+                    # Correct SwiGLU logic
+                    activated_hidden = tl.sigmoid(hidden1) * hidden1 # SiLU
 
-            # --- Tiled GEMM for W2 ---
-            acc2 = tl.zeros((BLOCK_SIZE_M, D_MODEL), dtype=tl.float32)
-            for i in range(0, D_FF, BLOCK_SIZE_FF):
-                hidden_offsets = tl.arange(0, BLOCK_SIZE_FF) + i
-                hidden_chunk = tl.load(fused_hidden[:, hidden_offsets]) # Simplified load
+                    fused_result = activated_hidden * gate_val
+                    expert_output = tl.dot(fused_result, w2)
 
-                w2_offsets = expert_indices[:, None, None] * D_FF * D_MODEL + hidden_offsets[None, :, None] * D_MODEL + tl.arange(0, D_MODEL)[None, None, :]
-                w2_chunk = tl.load(weights2_ptr + w2_offsets, mask=token_mask[:, None, None])
+                    output_token_accumulator += expert_output[0] * gate_weight
 
-                acc2 += tl.dot(hidden_chunk, w2_chunk)
-
-            final_output += acc2 * gate_weights[:, None]
-
-        # Store the result
-        output_offsets = token_offsets[:, None] * D_MODEL + tl.arange(0, D_MODEL)[None, :]
-        tl.store(output_ptr + output_offsets, final_output, mask=token_mask[:, None])
+                # Store the final result for the token
+                output_offsets = current_token_idx * stride_o_n + tl.arange(0, D_MODEL) * stride_o_d
+                tl.store(output_ptr + output_offsets, output_token_accumulator)
 
     def moe_dispatch_triton(self, x, topk_indices, gate_weights):
         output = torch.empty_like(x)
         n_tokens, d_model = x.shape
         d_ff = self.experts[0].w1.out_features
 
-        grid = lambda meta: (triton.cdiv(n_tokens, meta['BLOCK_SIZE_M']),)
+        grid = lambda meta: (triton.cdiv(n_tokens, meta['BLOCK_SIZE_N']),)
 
         self.fused_swiglu_kernel[grid](
             x, topk_indices, gate_weights,
             self.weights1, self.weights_gate, self.weights2,
             output,
             n_tokens=n_tokens,
-            D_MODEL=d_model, D_FF=d_ff, TOP_K=self.top_k
+            stride_x_n=x.stride(0), stride_x_d=x.stride(1),
+            stride_ei_n=topk_indices.stride(0), stride_ei_k=topk_indices.stride(1),
+            stride_gw_n=gate_weights.stride(0), stride_gw_k=gate_weights.stride(1),
+            stride_w1_e=self.weights1.stride(0), stride_w1_d=self.weights1.stride(1), stride_w1_f=self.weights1.stride(2),
+            stride_wg_e=self.weights_gate.stride(0), stride_wg_d=self.weights_gate.stride(1), stride_wg_f=self.weights_gate.stride(2),
+            stride_w2_e=self.weights2.stride(0), stride_w2_f=self.weights2.stride(1), stride_w2_d=self.weights2.stride(2),
+            stride_o_n=output.stride(0), stride_o_d=output.stride(1),
+            D_MODEL=d_model, D_FF=d_ff, TOP_K=self.top_k,
+            BLOCK_SIZE_N=64, # Or another suitable block size
         )
         return output
 
