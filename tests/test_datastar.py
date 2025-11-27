@@ -1,0 +1,92 @@
+import os
+import time
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.csv as pacsv
+import torch
+import torch.nn as nn
+import pytest
+from datastar import DataStarGPUFrame, colg
+
+# Define constants
+CSV_PATH = "test_data.csv"
+BATCH_SIZE = 4096
+
+def generate_csv_if_needed(path: str, n_rows: int = 10_000, seed: int = 42) -> None:
+    if os.path.exists(path):
+        os.remove(path)
+
+    rng = np.random.default_rng(seed)
+    ages = rng.integers(18, 80, size=n_rows, dtype=np.int32)
+    scores = rng.random(size=n_rows, dtype=np.float32)
+    labels = rng.integers(0, 2, size=n_rows, dtype=np.int8)
+
+    df = pd.DataFrame({
+        "age": ages,
+        "score": scores,
+        "label": labels,
+    })
+    df.to_csv(path, index=False)
+
+class TinyMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+def test_datastar_pipeline():
+    # Setup
+    generate_csv_if_needed(CSV_PATH)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Testing on device: {device}")
+
+    # Read CSV using pyarrow
+    table = pacsv.read_csv(CSV_PATH)
+
+    # Initialize DataStarGPUFrame
+    ds = DataStarGPUFrame.from_arrow_table(table, device=device, numeric_only=True)
+    assert len(ds) == 10_000
+
+    # Filter and Select
+    ds2 = ds.filter(colg("age") > 30).select(["age", "score", "label"])
+
+    # Check if filtering worked (approx check since we use random data)
+    assert len(ds2) < 10_000
+
+    # Model
+    model = TinyMLP().to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    criterion = nn.CrossEntropyLoss()
+
+    # Train loop
+    model.train()
+    for batch in ds2.batch(BATCH_SIZE, drop_last=False):
+        t = batch.to_tensor(["age", "score", "label"])
+
+        # Verify types
+        assert t["age"].device == device
+
+        X = torch.stack([t["age"].float(), t["score"].float()], dim=-1)
+        y = t["label"].long()
+
+        optimizer.zero_grad()
+        logits = model(X)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+
+    print("Training loop completed successfully.")
+
+    # Cleanup
+    if os.path.exists(CSV_PATH):
+        os.remove(CSV_PATH)
+
+if __name__ == "__main__":
+    test_datastar_pipeline()
