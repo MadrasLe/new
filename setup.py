@@ -1,0 +1,23 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="datastar",
+    version="0.1.0",
+    description="A high-performance GPU-first data loading library",
+    author="Jules",
+    packages=find_packages(),
+    install_requires=[
+        "torch",
+        "numpy",
+        "pandas",
+        "pyarrow",
+        "transformers",
+        "tqdm",
+    ],
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: OS Independent",
+    ],
+    python_requires='>=3.8',
+)
