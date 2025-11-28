@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.parquet
+*.star
+*.bin
+*.jsonl
+local_cache_nvme/
+big_data_*/
