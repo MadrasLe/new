@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datastar"
+version = "0.1.0"
+description = "GPU-first data engine for LLM & ML pipelines"
+authors = [{ name = "Gabriel", email = "gabriel@example.com" }]
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+  "torch",
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "tqdm",
+  "datasets",
+  "transformers",
+]
+
+[project.optional-dependencies]
+vision = ["torchvision"]
+bench = ["psutil"]
+
+[project.urls]
+Homepage = "https://github.com/SEUUSER/datastar"
+Issues = "https://github.com/SEUUSER/datastar/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
